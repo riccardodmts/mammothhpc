@@ -14,6 +14,7 @@ Example usage:
 # LICENSE file in the root directory of this source tree.
 
 import torch
+from copy import deepcopy
 
 from models.utils.continual_model import ContinualModel
 from utils.args import add_rehearsal_args, ArgumentParser
@@ -33,6 +34,9 @@ class ErEMA(ContinualModel):
         This model requires the `add_rehearsal_args` to include the buffer-related arguments.
         """
         add_rehearsal_args(parser)
+        parser.add_argument('--alpha', type=float, default=0.5, help='Penalty weight.')
+        parser.add_argument('--softmax_temp', type=float, default=2, help='Temperature of the softmax function.')
+        parser.add_argument("--ema", type=float, default=0.996, help='Momentum teacher')
         return parser
 
     def __init__(self, backbone, loss, args, transform, dataset=None):
@@ -41,6 +45,8 @@ class ErEMA(ContinualModel):
         """
         super(ErEMA, self).__init__(backbone, loss, args, transform, dataset=dataset)
         self.buffer = Buffer(self.args.buffer_size)
+        self.gamma = self.args.ema
+        self.count = 0
 
     def observe(self, inputs, labels, not_aug_inputs, epoch=None):
         """
@@ -65,3 +71,19 @@ class ErEMA(ContinualModel):
                              labels=labels[:real_batch_size])
 
         return loss.item()
+
+    def begin_task(self, dataset):
+        if self.count == 0:
+            self.old_net = deepcopy(self.net)
+            self.old_net.to(self.device)
+            for param in self.old_net.features.parameters():
+                param.requires_grad = False
+            self.old_net.train()
+        self.count += 1
+        
+    def update_teacher(self):
+        # EMA update for the teacher
+        with torch.no_grad():
+            m = self.gamma  # momentum parameter
+            for param_q, param_k in zip(self.net.module.parameters(), self.old_net.parameters()):
+                param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
