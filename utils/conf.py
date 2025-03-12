@@ -89,9 +89,9 @@ def get_device(avail_devices: str = None) -> torch.device:
     def _get_device(avail_devices: List[int] = None) -> torch.device:
         # get least used gpu by used memory
         if torch.cuda.is_available() and torch.cuda.device_count() > 0 and len(avail_devices) > 0:
-            gpu_memory = get_alloc_memory_all_devices()
-            gpu_memory = [gpu_memory[i] for i in avail_devices]
-            device = torch.device(f'cuda:{avail_devices[np.argmin(gpu_memory)]}')
+            #gpu_memory = get_alloc_memory_all_devices()
+            #gpu_memory = [gpu_memory[i] for i in avail_devices]
+            device = torch.device(f'cuda:{avail_devices[0]}')
             return device
         try:
             if torch.backends.mps.is_available() and torch.backends.mps.is_built():
