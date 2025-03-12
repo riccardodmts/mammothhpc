@@ -16,9 +16,37 @@ Example usage:
 import torch
 from copy import deepcopy
 
+from torch.nn import functional as F
+
 from models.utils.continual_model import ContinualModel
 from utils.args import add_rehearsal_args, ArgumentParser
 from utils.buffer import Buffer
+
+
+def kl_divergence_stable(logits_student, logits_teacher, temperature=1.0):
+    """
+    Numerically stable KL divergence for knowledge distillation.
+    
+    Args:
+        logits_student (Tensor): Logits from the student network (B x C).
+        logits_teacher (Tensor): Logits from the teacher network (B x C).
+        temperature (float): Temperature scaling factor.
+        
+    Returns:
+        Tensor: The KL divergence loss.
+    """
+    # Apply temperature scaling
+    scaled_logits_student = logits_student / temperature
+    scaled_logits_teacher = logits_teacher / temperature
+
+    # Compute log probabilities in a numerically stable way
+    log_p_student = F.log_softmax(scaled_logits_student, dim=-1)
+    log_p_teacher = F.log_softmax(scaled_logits_teacher, dim=-1)
+    
+    # Compute KL divergence using teacher's soft probabilities
+    kl_loss = F.kl_div(log_p_student, log_p_teacher.exp(), reduction='batchmean')
+
+    return kl_loss
 
 
 class ErEMA(ContinualModel):
@@ -34,8 +62,8 @@ class ErEMA(ContinualModel):
         This model requires the `add_rehearsal_args` to include the buffer-related arguments.
         """
         add_rehearsal_args(parser)
-        parser.add_argument('--alpha', type=float, default=0.5, help='Penalty weight.')
-        parser.add_argument('--softmax_temp', type=float, default=2, help='Temperature of the softmax function.')
+        parser.add_argument('--alpha', type=float, default=0.25, help='Penalty weight.')
+        parser.add_argument('--softmax_temp', type=float, default=1.0, help='Temperature of the softmax function.')
         parser.add_argument("--ema", type=float, default=0.996, help='Momentum teacher')
         return parser
 
@@ -54,21 +82,33 @@ class ErEMA(ContinualModel):
         """
 
         real_batch_size = inputs.shape[0]
+        temp = not_aug_inputs
 
         self.opt.zero_grad()
         if not self.buffer.is_empty():
-            buf_inputs, buf_labels = self.buffer.get_data(
-                self.args.minibatch_size, transform=self.transform, device=self.device)
+            buf_no_aug, buf_inputs, buf_labels = self.buffer.get_data(
+                self.args.minibatch_size, transform=self.transform, device=self.device, return_not_aug=True)
             inputs = torch.cat((inputs, buf_inputs))
+            temp = torch.cat((not_aug_inputs, buf_no_aug))
             labels = torch.cat((labels, buf_labels))
 
         outputs = self.net(inputs)
         loss = self.loss(outputs, labels)
+
+
+        logits = self.old_net(temp)
+
+        loss += self.args.alpha  * kl_divergence_stable(outputs, logits, self.args.softmax_temp)
+
+
         loss.backward()
         self.opt.step()
 
         self.buffer.add_data(examples=not_aug_inputs,
                              labels=labels[:real_batch_size])
+        
+        if self.gamma > 0.0:
+            self.update_teacher()
 
         return loss.item()
 
@@ -76,7 +116,7 @@ class ErEMA(ContinualModel):
         if self.count == 0:
             self.old_net = deepcopy(self.net)
             self.old_net.to(self.device)
-            for param in self.old_net.features.parameters():
+            for param in self.old_net.parameters():
                 param.requires_grad = False
             self.old_net.train()
         self.count += 1
@@ -85,5 +125,5 @@ class ErEMA(ContinualModel):
         # EMA update for the teacher
         with torch.no_grad():
             m = self.gamma  # momentum parameter
-            for param_q, param_k in zip(self.net.module.parameters(), self.old_net.parameters()):
+            for param_q, param_k in zip(self.net.parameters(), self.old_net.parameters()):
                 param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
